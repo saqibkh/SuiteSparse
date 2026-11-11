@@ -1,0 +1,287 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the CUDA parts of SuiteSparse and runs them on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it. build.yaml is unchanged.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ dev2 ]
+    paths:
+      - "CHOLMOD/**"
+      - "GraphBLAS/**"
+      - "SuiteSparse_config/**"
+      - "AMD/**"
+      - "CAMD/**"
+      - "COLAMD/**"
+      - "CCOLAMD/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cholmod:
+    name: CHOLMOD GPU path (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y libopenblas-dev
+
+      # library-path is disabled so that the toolkit's cuBLAS is the one
+      # CHOLMOD links against and loads.
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ca87fe3143b29166822b923d6050945c5179408c # v0.1.5
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+          library-path: 'false'
+
+      # The simulator needs a shared CUDA runtime, and CHOLMOD asks for the
+      # static one in three places, so switch those to shared here (the
+      # sources are not changed in the pull request). 90-virtual embeds PTX
+      # only, which the simulator runs. -DBLAS_TIMER makes CHOLMOD count its
+      # GPU BLAS calls, which the GPU check below uses to prove that the GPU
+      # path ran.
+      - name: Configure
+        run: |
+          sed -i -e 's/CUDA_RUNTIME_LIBRARY Static/CUDA_RUNTIME_LIBRARY Shared/' \
+                 -e 's/CUDA::cudart_static/CUDA::cudart/g' \
+                 -e 's/-lcudart_static/-lcudart/' CHOLMOD/CMakeLists.txt
+          sed -i -e 's/-cudart=static/-cudart=shared/' \
+                 -e 's/CUDA::cudart_static/CUDA::cudart/g' CHOLMOD/GPU/CMakeLists.txt
+          if grep -rn "cudart.static\|cudart=static" CHOLMOD --include=CMakeLists.txt; then
+            echo "unexpected static CUDA runtime left in CHOLMOD"; exit 1
+          fi
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSUITESPARSE_ENABLE_PROJECTS="cholmod" \
+            -DSUITESPARSE_USE_FORTRAN=OFF \
+            -DSUITESPARSE_USE_CUDA=ON \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+            -DSUITESPARSE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+            -DCMAKE_C_FLAGS=-DBLAS_TIMER \
+            -DSUITESPARSE_DEMOS=ON \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build -j3
+
+      # The CHOLMOD demos (20 tests). CHOLMOD_USE_GPU=1 asks for the GPU path;
+      # these matrices are too small to reach the GPU kernels, so this is a
+      # regression check of the CUDA build. The next step covers the GPU.
+      - name: CHOLMOD demos with CHOLMOD_USE_GPU=1
+        run: CHOLMOD_USE_GPU=1 vgpu run ctest --test-dir build --output-on-failure
+
+      # A 3D Laplacian on a 32x32x32 grid (n = 32768) is large enough for
+      # supernodes that CHOLMOD sends to the GPU (>= 256 rows, 32 columns for
+      # SYRK and GEMM, 512 columns for POTRF). The check fails unless the GPU
+      # SYRK, GEMM and POTRF counters are non-zero, and unless the solution
+      # of A x = A 1 is 1 to 1e-9. (The cuBLAS and cuSOLVER calls are computed
+      # on the host by the simulator; the CHOLMOD CUDA kernels are simulated.)
+      - name: CHOLMOD supernodal factorization on the GPU
+        run: |
+          python3 - > "$RUNNER_TEMP/lap32.mtx" <<'PY'
+          n = 32
+          idx = lambda i, j, k: (i * n + j) * n + k + 1
+          ent = []
+          for i in range(n):
+              for j in range(n):
+                  for k in range(n):
+                      p = idx(i, j, k)
+                      ent.append((p, p, 6.0))
+                      for a, b, c in ((i + 1, j, k), (i, j + 1, k), (i, j, k + 1)):
+                          if a < n and b < n and c < n:
+                              ent.append((idx(a, b, c), p, -1.0))
+          print("%%MatrixMarket matrix coordinate real symmetric")
+          print(n ** 3, n ** 3, len(ent))
+          for r, c, v in ent:
+              print(r, c, v)
+          PY
+          cat > "$RUNNER_TEMP/gpu_check.c" <<'C'
+          #include <stdio.h>
+          #include <math.h>
+          #include "cholmod.h"
+          int main (int argc, char **argv)
+          {
+              cholmod_common c ;
+              cholmod_l_start (&c) ;
+              c.useGPU = 1 ;
+              FILE *f = fopen (argv [1], "r") ;
+              if (!f) { printf ("cannot open %s\n", argv [1]) ; return 1 ; }
+              cholmod_sparse *A = cholmod_l_read_sparse (f, &c) ;
+              fclose (f) ;
+              size_t n = A->nrow ;
+              cholmod_dense *X = cholmod_l_ones (n, 1, CHOLMOD_REAL, &c) ;
+              cholmod_dense *B = cholmod_l_zeros (n, 1, CHOLMOD_REAL, &c) ;
+              double one [2] = {1, 0}, zero [2] = {0, 0} ;
+              cholmod_l_sdmult (A, 0, one, zero, X, B, &c) ;     // B = A * ones
+              cholmod_factor *L = cholmod_l_analyze (A, &c) ;
+              cholmod_l_factorize (A, L, &c) ;
+              cholmod_dense *Y = cholmod_l_solve (CHOLMOD_A, L, B, &c) ;
+              double err = 0 ;
+              for (size_t i = 0 ; i < n ; i++)
+                  err = fmax (err, fabs (((double *) Y->x) [i] - 1)) ;
+              printf ("n %zu supernodal %d useGPU %d\n", n, L->is_super, c.useGPU) ;
+              printf ("GPU calls: syrk %zu gemm %zu potrf %zu trsm %zu\n",
+                  c.CHOLMOD_GPU_SYRK_CALLS, c.CHOLMOD_GPU_GEMM_CALLS,
+                  c.CHOLMOD_GPU_POTRF_CALLS, c.CHOLMOD_GPU_TRSM_CALLS) ;
+              printf ("max |x - 1| = %g\n", err) ;
+              int ok = c.status == CHOLMOD_OK && L->is_super && c.useGPU == 1 &&
+                  c.CHOLMOD_GPU_SYRK_CALLS > 0 && c.CHOLMOD_GPU_GEMM_CALLS > 0 &&
+                  c.CHOLMOD_GPU_POTRF_CALLS > 0 && err < 1e-9 ;
+              cholmod_l_free_dense (&Y, &c) ; cholmod_l_free_dense (&B, &c) ;
+              cholmod_l_free_dense (&X, &c) ; cholmod_l_free_factor (&L, &c) ;
+              cholmod_l_free_sparse (&A, &c) ; cholmod_l_finish (&c) ;
+              printf (ok ? "PASS\n" : "FAIL\n") ;
+              return ok ? 0 : 1 ;
+          }
+          C
+          LIBS=$(find build -name '*.so' -printf '%h\n' | sort -u | paste -sd:)
+          gcc -O1 "$RUNNER_TEMP/gpu_check.c" -o "$RUNNER_TEMP/gpu_check" \
+            -ICHOLMOD/Include -ISuiteSparse_config -I/usr/local/cuda-13.0/include \
+            -Lbuild/CHOLMOD -lcholmod -Lbuild/SuiteSparse_config -lsuitesparseconfig -lm
+          LD_LIBRARY_PATH="$LIBS" vgpu run "$RUNNER_TEMP/gpu_check" "$RUNNER_TEMP/lap32.mtx"
+
+  graphblas:
+    name: GraphBLAS CUDA JIT (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ca87fe3143b29166822b923d6050945c5179408c # v0.1.5
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+          library-path: 'false'
+
+      # GraphBLAS/CMakeLists.txt switches its CUDA support off ("CUDA is under
+      # development for now"). This job turns it on, so it covers the CUDA
+      # kernels as they are in the tree, not a released feature. It also
+      # links the shared CUDA runtime, which the simulator needs. GRAPHBLAS_COMPACT
+      # skips the pre-generated FactoryKernels to keep the build short. The
+      # library fetches rmm with CPM at configure time.
+      - name: Configure
+        run: |
+          sed -i 's/^  set ( GRAPHBLAS_USE_CUDA OFF )/  set ( GRAPHBLAS_USE_CUDA ON )/' GraphBLAS/CMakeLists.txt
+          grep -q "^  set ( GRAPHBLAS_USE_CUDA ON )" GraphBLAS/CMakeLists.txt
+          sed -i 's/CUDA::cudart_static/CUDA::cudart/g' GraphBLAS/CMakeLists.txt
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSUITESPARSE_ENABLE_PROJECTS="graphblas" \
+            -DSUITESPARSE_USE_FORTRAN=OFF \
+            -DSUITESPARSE_USE_CUDA=ON \
+            -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+            -DSUITESPARSE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+            -DGRAPHBLAS_COMPACT=ON
+
+      - name: Build
+        run: cmake --build build -j3 --target GraphBLAS
+
+      # Matrices are placed in GPU arena 0, so GrB_reduce and the masked
+      # dot-product GrB_mxm run as CUDA kernels. GraphBLAS compiles those
+      # kernels at run time with nvcc (not NVRTC), for the compute capability
+      # of the device. The test compares the GPU results with the same
+      # operations on host arena matrices, and fails if the data is not in
+      # the GPU arena (a plain GrB_Matrix_new is in host arena 0).
+      - name: GraphBLAS CUDA reduce and mxm on the GPU
+        run: |
+          cat > "$RUNNER_TEMP/gb_cuda.c" <<'C'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <math.h>
+          #include "GraphBLAS.h"
+          #define OK(x) do { GrB_Info i_ = (x) ; if (i_ != GrB_SUCCESS) { \
+              printf ("FAIL line %d: info %d\n", __LINE__, (int) i_) ; return 1 ; } } while (0)
+          #define GPU (GxB_NARENAS + 0)
+
+          static GrB_Matrix make (int64_t n, int64_t seed, int gpu)
+          {
+              GrB_Matrix A ;
+              GrB_Matrix_new (&A, GrB_FP64, n, n) ;
+              GxB_Matrix_set_arenas (&A, gpu ? GPU : 0, gpu ? GPU : 0) ;
+              for (int64_t i = 0 ; i < n ; i++)
+                  for (int64_t j = (i * seed) % 7 ; j < n ; j += 7)
+                      GrB_Matrix_setElement_FP64 (A,
+                          (double) ((i*5 + j*3 + seed) % 11) + 0.5, i, j) ;
+              GrB_Matrix_wait (A, GrB_MATERIALIZE) ;
+              return (A) ;
+          }
+
+          int main (void)
+          {
+              OK (GrB_init (GrB_NONBLOCKING)) ;
+              int32_t ids [1] = {0} ;
+              OK (GrB_Global_set_INT32 (GrB_GLOBAL, 1, GxB_NGPUS)) ;
+              OK (GrB_Global_set_VOID (GrB_GLOBAL, ids, GxB_GPU_IDS, sizeof (ids))) ;
+              OK (GxB_Global_Option_set (GxB_BURBLE, 1)) ;
+              int64_t n = 400 ;
+              GrB_Matrix Ag = make (n, 1, 1), Bg = make (n, 3, 1), Mg = make (n, 2, 1) ;
+              GrB_Matrix Ac = make (n, 1, 0), Bc = make (n, 3, 0), Mc = make (n, 2, 0) ;
+              int32_t da = -1 ;
+              OK (GrB_Matrix_get_INT32 (Ag, &da, GxB_ARENA_DATA)) ;
+              printf ("A data arena %d (GPU arena is %d)\n", da, GPU) ;
+              int32_t dc = -1 ;
+              OK (GrB_Matrix_get_INT32 (Ac, &dc, GxB_ARENA_DATA)) ;
+              printf ("host matrix data arena %d\n", dc) ;
+              int ok = (da == GPU && dc == 0) ;
+
+              double sg = 0, sc = 0 ;
+              OK (GrB_Matrix_reduce_FP64 (&sg, NULL, GrB_PLUS_MONOID_FP64, Ag, NULL)) ;
+              OK (GrB_Matrix_reduce_FP64 (&sc, NULL, GrB_PLUS_MONOID_FP64, Ac, NULL)) ;
+              printf ("reduce: gpu %.6f cpu %.6f\n", sg, sc) ;
+              ok = ok && fabs (sg - sc) < 1e-9 * fabs (sc) ;
+
+              GrB_Matrix Cg, Cc ;
+              GrB_Matrix_new (&Cg, GrB_FP64, n, n) ;
+              GxB_Matrix_set_arenas (&Cg, GPU, GPU) ;
+              GrB_Matrix_new (&Cc, GrB_FP64, n, n) ;
+              GxB_Matrix_set_arenas (&Cc, 0, 0) ;
+              OK (GrB_mxm (Cg, Mg, NULL, GrB_PLUS_TIMES_SEMIRING_FP64, Ag, Bg, GrB_DESC_ST1)) ;
+              OK (GrB_mxm (Cc, Mc, NULL, GrB_PLUS_TIMES_SEMIRING_FP64, Ac, Bc, GrB_DESC_ST1)) ;
+              double tg = 0, tc = 0 ;
+              GrB_Index ng = 0, nc = 0 ;
+              OK (GrB_Matrix_reduce_FP64 (&tg, NULL, GrB_PLUS_MONOID_FP64, Cg, NULL)) ;
+              OK (GrB_Matrix_reduce_FP64 (&tc, NULL, GrB_PLUS_MONOID_FP64, Cc, NULL)) ;
+              OK (GrB_Matrix_nvals (&ng, Cg)) ;
+              OK (GrB_Matrix_nvals (&nc, Cc)) ;
+              printf ("mxm: gpu nvals %lu sum %.6f, cpu nvals %lu sum %.6f\n",
+                  (unsigned long) ng, tg, (unsigned long) nc, tc) ;
+              ok = ok && ng == nc && nc > 0 && fabs (tg - tc) < 1e-9 * fabs (tc) ;
+              GrB_finalize () ;
+              printf (ok ? "PASS\n" : "FAIL\n") ;
+              return ok ? 0 : 1 ;
+          }
+          C
+          GBDIR=$(dirname "$(find build -name 'libgraphblas.so' | head -n 1)")
+          gcc -O1 "$RUNNER_TEMP/gb_cuda.c" -o "$RUNNER_TEMP/gb_cuda" \
+            -IGraphBLAS/Include -L"$GBDIR" -lgraphblas -lm
+          LD_LIBRARY_PATH="$PWD/$GBDIR" vgpu run "$RUNNER_TEMP/gb_cuda" | tee "$RUNNER_TEMP/gb.log"
+          # two reductions and one mxm on the GPU, none on the host matrices
+          [ "$(grep -c 'GrB_reduce (cuda reduce' "$RUNNER_TEMP/gb.log")" = 2 ]
+          [ "$(grep -c 'cuda dot3' "$RUNNER_TEMP/gb.log")" = 1 ]
